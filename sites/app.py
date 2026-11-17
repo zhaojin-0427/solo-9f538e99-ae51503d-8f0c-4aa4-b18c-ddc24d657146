@@ -14,15 +14,24 @@ Endpoints:
   GET /busy                  always 503 + Retry-After: 1     (retry exhaustion)
   GET /flaky-no-ra           always 429 without Retry-After
   GET /slow/{n}?delay=       sleeps `delay` seconds, then article
+
+Review (re-verification) test endpoints:
+  GET /mutable/{n}           stateful article; POST /mutable/{n}/edit changes it,
+                             POST /mutable/{n}/withdraw?status=404|410 withdraws it,
+                             POST /mutable/{n}/blank makes it return an empty page
+  GET /gated/{n}             first review request (X-Review-Id header) gets 429 +
+                             Retry-After: 1, every later request gets the article;
+                             used to make an earlier review deterministically slower
   GET /stats                 per-path request timestamps (test observability)
-  POST /reset                clear stats and flaky counters
+  POST /reset                clear stats, flaky counters and mutable/gate state
 """
 import asyncio
+import json
 import os
 import time
 from collections import defaultdict
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 SITE_NAME = os.environ.get("SITE_NAME", "site")
@@ -32,6 +41,9 @@ app = FastAPI(title=f"mock tender site {SITE_NAME}")
 _START = time.monotonic()
 _HITS: dict[str, list[float]] = defaultdict(list)   # path -> request timestamps (s, relative)
 _FLAKY: dict[str, int] = defaultdict(int)           # flaky key -> 429s already served
+# mutable endpoint state: key -> {"mode": "article"|"withdrawn"|"blank", "status": int, "version": int}
+_MUTABLE: dict[str, dict] = {}
+_GATE_FIRED: set[str] = set()                       # gated paths already served their 429
 
 
 @app.middleware("http")
@@ -70,6 +82,8 @@ async def index():
 <li><a href="/chain/3">/chain/3</a> 双向跳转链（3 跳）</li>
 <li><a href="/flaky/1">/flaky/1</a> 限流后恢复（429 + Retry-After）</li>
 <li><a href="/slow/1">/slow/1</a> 慢响应</li>
+<li><a href="/mutable/1">/mutable/1</a> 可改写/撤回的公告（复核测试）</li>
+<li><a href="/gated/1">/gated/1</a> 首次复核请求限流一次（复核交错测试）</li>
 </ul></body></html>"""
 
 
@@ -122,13 +136,129 @@ async def slow(n: int, delay: float = Query(3.0, ge=0.0, le=30.0)):
     return _article_html(n, note=f"（慢响应 {delay}s）")
 
 
+def _mutable_html(n: int, version: int) -> str:
+    # Different per-version wording so an edit is visible to the extractor.
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>可变公告 {n} 号 v{version} - {SITE_NAME} 政府采购网</title></head>
+<body>
+<article>
+<h2>招标公告（编号：{SITE_NAME.upper()}-MUT-{n:04d}，版本 {version}）</h2>
+<p>项目名称：{SITE_NAME} 可变公告第 {n} 号，当前内容版本 {version}。</p>
+<p>预算金额：人民币 {n + version}00 万元整。</p>
+<p>版本说明：第 {version} 版正文，用于复核改写检测。</p>
+</article>
+</body>
+</html>"""
+
+
+def _mutable_state(key: str) -> dict:
+    return _MUTABLE.setdefault(key, {"mode": "article", "status": 404, "version": 1})
+
+
+@app.get("/mutable/{n}", response_class=HTMLResponse)
+async def mutable_get(n: int):
+    st = _mutable_state(f"mutable:{n}")
+    if st["mode"] == "withdrawn":
+        return JSONResponse({"detail": "announcement withdrawn"},
+                            status_code=st["status"])
+    if st["mode"] == "blank":
+        return HTMLResponse("<!DOCTYPE html><html><head></head><body></body></html>")
+    if st["mode"] == "rate_limited":
+        return JSONResponse({"detail": "permanently rate limited (no retry-after)"},
+                            status_code=429)
+    return _mutable_html(n, st["version"])
+
+
+@app.post("/mutable/{n}/edit")
+async def mutable_edit(n: int):
+    st = _mutable_state(f"mutable:{n}")
+    st["mode"] = "article"
+    st["version"] += 1
+    return {"edited": True, "version": st["version"]}
+
+
+@app.post("/mutable/{n}/withdraw")
+async def mutable_withdraw(n: int, status: int = Query(404)):
+    if status not in (404, 410):
+        return JSONResponse({"detail": "status must be 404 or 410"}, status_code=422)
+    st = _mutable_state(f"mutable:{n}")
+    st["mode"] = "withdrawn"
+    st["status"] = status
+    return {"withdrawn": True, "status": status}
+
+
+@app.post("/mutable/{n}/blank")
+async def mutable_blank(n: int):
+    st = _mutable_state(f"mutable:{n}")
+    st["mode"] = "blank"
+    return {"blank": True}
+
+
+@app.post("/mutable/{n}/rate-limit")
+async def mutable_rate_limit(n: int):
+    """Switch the page to permanent 429 without Retry-After (review failure)."""
+    st = _mutable_state(f"mutable:{n}")
+    st["mode"] = "rate_limited"
+    return {"rate_limited": True}
+
+
+@app.get("/gated/{n}", response_class=HTMLResponse)
+async def gated(n: int, request: Request):
+    """First review request is rate limited once; everything else succeeds.
+
+    Review requests carry X-Review-Id. The first such request to a gated
+    path gets a 429 + Retry-After: 1 (and triggers the shared origin
+    cooldown); retries and any later review get the article immediately.
+    """
+    key = f"gated:{n}"
+    review_id = request.headers.get("x-review-id")
+    if review_id and key not in _GATE_FIRED:
+        _GATE_FIRED.add(key)
+        return JSONResponse({"detail": "gated: first review attempt rate limited"},
+                            status_code=429, headers={"Retry-After": "1"})
+    return _article_html(n, note="（门控放行）")
+
+
+@app.get("/hold/{n}", response_class=HTMLResponse)
+async def hold(n: int, request: Request):
+    """Deterministically slow review endpoint for interleaved-review tests.
+
+    The first request carrying an X-Review-Id is answered 429 +
+    Retry-After: 2 (shared origin cooldown). Every later request of THAT
+    review id sleeps 2s before returning the article, while another review
+    id gets the article immediately. This makes the earlier review
+    deterministically slower end-to-end without relying on timing luck.
+    """
+    key = f"hold:{n}"
+    review_id = request.headers.get("x-review-id")
+    if not review_id:
+        return _article_html(n)
+    if key not in _GATE_FIRED:
+        _GATE_FIRED.add(key)
+        return JSONResponse({"detail": "hold: first review attempt rate limited"},
+                            status_code=429, headers={"Retry-After": "2"})
+    held_key = f"hold-slow:{review_id}:{n}"
+    if held_key not in _GATE_FIRED:
+        _GATE_FIRED.add(held_key)
+        await asyncio.sleep(2.0)
+    return _article_html(n, note="（延迟放行）")
+
+
 @app.get("/stats")
 async def stats():
-    return {"site": SITE_NAME, "hits": {path: ts for path, ts in sorted(_HITS.items())}}
+    return {
+        "site": SITE_NAME,
+        "hits": {path: ts for path, ts in sorted(_HITS.items())},
+        "mutable": json.loads(json.dumps(_MUTABLE)),
+        "gate_fired": sorted(_GATE_FIRED),
+    }
 
 
 @app.post("/reset")
 async def reset():
     _HITS.clear()
     _FLAKY.clear()
+    _MUTABLE.clear()
+    _GATE_FIRED.clear()
     return {"reset": True}
