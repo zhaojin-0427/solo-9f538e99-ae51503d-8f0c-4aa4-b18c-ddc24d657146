@@ -1,0 +1,31 @@
+services:
+  api:
+    build: ./api
+    ports:
+      - "8000:8000"          # http://localhost:8000/docs
+    environment:
+      DB_PATH: /data/app.db
+    volumes:
+      - api_data:/data       # keeps jobs + cooldowns across container restarts
+    depends_on:
+      - site_a
+      - site_b
+
+  site_a:
+    build: ./sites
+    environment:
+      SITE_NAME: site_a
+      PEER_BASE: http://site_b:8000
+    ports:
+      - "8001:8000"          # reachable as http://site_a:8000 from the API
+
+  site_b:
+    build: ./sites
+    environment:
+      SITE_NAME: site_b
+      PEER_BASE: http://site_a:8000
+    ports:
+      - "8002:8000"          # reachable as http://site_b:8000 from the API
+
+volumes:
+  api_data:
